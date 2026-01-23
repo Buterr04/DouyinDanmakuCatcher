@@ -22,6 +22,7 @@ import re
 import string
 import threading
 import time
+import asyncio
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 import urllib.parse
@@ -33,6 +34,8 @@ from py_mini_racer import MiniRacer
 
 from ac_signature import get__ac_signature
 from protobuf.douyin import ChatMessage, PushFrame, Response
+
+VERSION = "v0.3.0-auto"
 
 
 # ------------------ helpers ------------------ #
@@ -134,6 +137,8 @@ class DanmuFetcher:
         Poll Douyin web enter API to determine whether the room is live.
         Returns dict with keys: is_live(bool), status(int|None), title(str), anchor(str).
         """
+        if not self.live_id:
+            return {"is_live": False, "status": None, "anchor": "", "title": ""}
 
         ms_token = generate_ms_token()
         params = {
@@ -161,7 +166,11 @@ class DanmuFetcher:
 
         resp = self.session.get(api, headers=headers, timeout=10)
         resp.raise_for_status()
-        data = resp.json().get("data", {})
+        try:
+            data = resp.json().get("data", {})
+        except Exception:
+            # 非 JSON（可能风控/验证码），视为未开播
+            return {"is_live": False, "status": None, "anchor": "", "title": ""}
         room_list = data.get("data") or []
         room_info = room_list[0] if room_list else {}
         status = room_info.get("status")
@@ -262,125 +271,239 @@ class DanmuFetcher:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Fetch Douyin live danmu and save to file.")
-    parser.add_argument("--live-id", help="Douyin live room ID (from live.douyin.com/<id>)")
-    parser.add_argument("--out", help="Output file path (JSON Lines).")
-    parser.add_argument("--tz", help="Display timezone (e.g., Asia/Shanghai, UTC).")
-    parser.add_argument("--config", default="config/config.ini", help="Config file path (auto-created if missing).")
-    parser.add_argument("--poll-live", type=int, help="Polling interval (seconds) while live.")
-    parser.add_argument("--poll-off", type=int, help="Polling interval (seconds) while offline.")
+    parser = argparse.ArgumentParser(description="循环监测直播并按开播自动抓取抖音弹幕")
+    parser.add_argument("--config", default="config/config.ini", help="配置文件路径")
+    parser.add_argument("--url-config", default="config/URL_config.ini", help="直播间列表文件，一行一个")
     args = parser.parse_args()
 
-    defaults = {
-        "live_id": "",
-        "out": "danmu.jsonl",
-        "tz": "Asia/Shanghai",
-        "poll_live": 15,
-        "poll_off": 45,
-    }
+    # ---------- 加载配置 ---------- #
+    script_path = Path(__file__).parent.resolve()
+    default_path = script_path / "downloads"
+    default_path.mkdir(exist_ok=True)
 
-    cfg = configparser.ConfigParser()
-    cfg_path = Path(args.config)
-    cfg_dir = cfg_path.parent
-    os.makedirs(cfg_dir, exist_ok=True)
+    cfg = configparser.RawConfigParser()
+    cfg.read(args.config, encoding="utf-8-sig")
 
-    if cfg_path.exists():
-        cfg.read(cfg_path, encoding="utf-8")
-    if "douyin" not in cfg:
-        cfg["douyin"] = {}
+    def cfg_get(section, key, default):
+        if not cfg.has_section(section):
+            cfg.add_section(section)
+        if cfg.has_option(section, key):
+            return cfg.get(section, key)
+        cfg.set(section, key, str(default))
+        return default
 
-    # fill defaults for any missing keys
-    updated = False
-    for key, val in defaults.items():
-        if key not in cfg["douyin"]:
-            cfg["douyin"][key] = str(val)
-            updated = True
-    if updated:
-        with open(cfg_path, "w", encoding="utf-8") as f:
-            cfg.write(f)
+    delay_default = int(cfg_get("录制设置", "循环时间(秒)", 120))
+    loop_time = cfg_get("录制设置", "是否显示循环秒数", "否") == "是"
+    folder_by_author = cfg_get("录制设置", "保存文件夹是否以作者区分", "是") == "是"
+    folder_by_time = cfg_get("录制设置", "保存文件夹是否以时间区分", "否") == "是"
+    folder_by_title = cfg_get("录制设置", "保存文件夹是否以标题区分", "否") == "是"
+    filename_by_title = cfg_get("录制设置", "保存文件名是否包含标题", "否") == "是"
+    video_save_path = cfg_get("录制设置", "直播保存路径(不填则默认)", "")
+    tz_value = cfg_get("录制设置", "时区", "Asia/Shanghai")
 
-    live_id = args.live_id or cfg["douyin"].get("live_id", "").strip()
-    if not live_id:
-        raise SystemExit("请在 --live-id 或配置文件 [douyin].live_id 中提供直播间 ID")
-
-    out_path = args.out or cfg["douyin"].get("out", defaults["out"])
-    tz_value = args.tz or cfg["douyin"].get("tz", defaults["tz"])
-    poll_live = args.poll_live or int(cfg["douyin"].get("poll_live", defaults["poll_live"]))
-    poll_off = args.poll_off or int(cfg["douyin"].get("poll_off", defaults["poll_off"]))
+    # 同步写回默认值
+    with open(args.config, "w", encoding="utf-8") as f:
+        cfg.write(f)
 
     tz_offset = timedelta(hours=8) if tz_value.lower() == "asia/shanghai" else timedelta(0)
     display_tz = timezone(tz_offset)
 
-    fetcher = DanmuFetcher(live_id)
-    out_file = open(out_path, "a", encoding="utf-8")
+    # ---------- 解析 URL 列表 ---------- #
+    def get_quality_code(qn):
+        mapping = {"原画": "OD", "蓝光": "BD", "超清": "UHD", "高清": "HD", "标清": "SD", "流畅": "LD"}
+        return mapping.get(qn.strip(), "OD")
 
+    def parse_url_line(line: str):
+        line = line.strip()
+        if not line or line.startswith("#"):
+            return None
+        parts = [p.strip() for p in line.split(",") if p.strip()]
+        quality = "原画"
+        anchor = ""
+        url = ""
+        if len(parts) == 1:
+            url = parts[0]
+        else:
+            if parts[0].startswith("http"):
+                url = parts[0]
+            else:
+                quality = parts[0]
+                url = parts[1]
+                if len(parts) > 2 and "主播" in parts[2]:
+                    anchor = parts[2].split(":", 1)[-1].strip()
+        return {"quality": get_quality_code(quality), "url": url, "anchor": anchor}
+
+    def clean_name(text: str) -> str:
+        text = (text or "").strip()
+        if not text:
+            return "空白昵称"
+        text = re.sub(r'[\\\\/:*?"<>|#]+', "_", text)
+        return text.strip("_") or "空白昵称"
+
+    url_lines = []
+    url_cfg_path = Path(args.url_config)
+    url_cfg_path.parent.mkdir(exist_ok=True, parents=True)
+    if url_cfg_path.exists():
+        with open(url_cfg_path, "r", encoding="utf-8-sig") as f:
+            url_lines = [parse_url_line(i) for i in f.readlines()]
+    else:
+        url_cfg_path.write_text("", encoding="utf-8-sig")
+    url_tasks = [i for i in url_lines if i]
+    if not url_tasks:
+        raise SystemExit("URL_config.ini 为空，请填入直播间链接")
+
+    # ---------- 辅助函数 ---------- #
     def normalize_ts_ms(ts: int) -> int:
-        """
-        Normalize timestamp to milliseconds.
-        - 10 digits (seconds) -> *1000
-        - 13 digits (milliseconds) -> keep
-        - 16 digits (microseconds) -> //1000
-        - 19 digits (nanoseconds) -> //1_000_000
-        """
-        if ts < 1_000_000_000_0:          # <1e10  => seconds
+        if ts < 1_000_000_000_0:
             return ts * 1000
-        if ts < 1_000_000_000_0000:       # <1e13  => milliseconds
+        if ts < 1_000_000_000_0000:
             return ts
-        if ts < 1_000_000_000_0000000:    # <1e16  => microseconds
+        if ts < 1_000_000_000_0000000:
             return ts // 1000
-        return ts // 1_000_000            # nanoseconds
+        return ts // 1_000_000
 
-    def on_chat(chat: ChatMessage, server_now_ms: int):
-        recv_ts = time.time()
-        event_ms = normalize_ts_ms(chat.event_time)
-        server_now_ms = normalize_ts_ms(server_now_ms)
-        record = {
-            "event_ts_ms": event_ms,
-            "event_iso": datetime.fromtimestamp(event_ms / 1000, tz=display_tz).isoformat(),
-            "server_now_ms": server_now_ms,
-            "server_now_iso": datetime.fromtimestamp(server_now_ms / 1000, tz=display_tz).isoformat(),
-            "recv_iso": datetime.fromtimestamp(recv_ts, tz=display_tz).isoformat(),
-            "user_id": chat.user.id,
-            "user_name": chat.user.nick_name,
-            "content": chat.content,
-        }
-        out_file.write(json.dumps(record, ensure_ascii=False) + "\n")
-        out_file.flush()
-        print(f"[{record['event_iso']}] {record['user_name']}: {record['content']}")
+    def resolve_live_id(url: str) -> str:
+        """Resolve to live.douyin.com/<web_rid> by following redirects."""
+        try:
+            if "live.douyin.com/" in url:
+                return url.split("live.douyin.com/")[1].split("?")[0].split("/")[0]
+            # short链接或其他跳转
+            resp = requests.get(url, headers={"User-Agent": DanmuFetcher("", "").user_agent}, allow_redirects=True, timeout=10)
+            final = resp.url
+            if "live.douyin.com/" in final:
+                return final.split("live.douyin.com/")[1].split("?")[0].split("/")[0]
+        except Exception:
+            return ""
+        return ""
+
+    def build_outfile(platform: str, anchor: str, title: str):
+        base = Path(video_save_path) if video_save_path else default_path
+        platform_path = base / platform
+        anchor_clean = clean_name(anchor)
+        title_clean = clean_name(title) if title else ""
+        anchor_path = platform_path / anchor_clean if folder_by_author else platform_path
+        date_path = anchor_path / datetime.now(tz=display_tz).strftime("%Y-%m-%d") if folder_by_time else anchor_path
+        if folder_by_title and title_clean:
+            date_path = date_path / title_clean
+        date_path.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now(tz=display_tz).strftime("%Y-%m-%d_%H-%M-%S")
+        name = anchor_clean
+        if filename_by_title and title_clean:
+            name = f"{anchor_clean}_{title_clean}"
+        filename = f"{name}_{ts}.danmu.jsonl"
+        return date_path / filename
+
+    # ---------- 单直播任务线程 ---------- #
+    class LiveTask(threading.Thread):
+        def __init__(self, task_conf):
+            super().__init__(daemon=True)
+            self.url = task_conf["url"]
+            self.quality = task_conf["quality"]
+            self.anchor_hint = task_conf["anchor"]
+            self.running = False
+            self.fetcher = None
+            self.stop_flag = False
+            self.live_id = resolve_live_id(self.url)
+
+        def run(self):
+            while not self.stop_flag:
+                try:
+                    status = DanmuFetcher(self.live_id or "").fetch_live_status()
+                    is_live = status.get("is_live", False)
+                    anchor_name = status.get("anchor", "") or self.anchor_hint or self.live_id
+                    title = status.get("title", "") or ""
+                    if not self.live_id:
+                        self.live_id = resolve_live_id(self.url)
+
+                    ts = datetime.now(tz=display_tz).isoformat()
+                    if is_live and not self.running and self.live_id:
+                        outfile = build_outfile("抖音直播", anchor_name or self.live_id, title)
+                        print(f"[{ts}] {anchor_name or self.live_id} 开播，弹幕保存到 {outfile}")
+                        self.start_fetch(anchor_name or self.live_id, outfile)
+                    elif (not is_live) and self.running:
+                        print(f"[{ts}] {anchor_name or self.live_id} 已关播，停止弹幕抓取")
+                        self.stop_fetch()
+
+                except Exception as e:
+                    print(f"[task] {self.url} 状态检测失败: {e}")
+
+                sleep_time = delay_default
+                while sleep_time > 0 and not self.stop_flag:
+                    if loop_time:
+                        print(f"\r{self.url} 循环等待 {sleep_time} 秒 ", end="")
+                    time.sleep(1)
+                    sleep_time -= 1
+                if loop_time:
+                    print("\r检测直播间中...", end="")
+
+        def start_fetch(self, anchor_name: str, outfile: Path):
+            self.running = True
+            self.fetcher = DanmuFetcher(self.live_id)
+            out_file = open(outfile, "a", encoding="utf-8")
+
+            def on_chat(chat: ChatMessage, server_now_ms: int):
+                recv_ts = time.time()
+                event_ms = normalize_ts_ms(chat.event_time)
+                server_now_ms_norm = normalize_ts_ms(server_now_ms)
+                record = {
+                    "event_ts_ms": event_ms,
+                    "event_iso": datetime.fromtimestamp(event_ms / 1000, tz=display_tz).isoformat(),
+                    "server_now_ms": server_now_ms_norm,
+                    "server_now_iso": datetime.fromtimestamp(server_now_ms_norm / 1000, tz=display_tz).isoformat(),
+                    "recv_iso": datetime.fromtimestamp(recv_ts, tz=display_tz).isoformat(),
+                    "user_id": chat.user.id,
+                    "user_name": chat.user.nick_name,
+                    "content": chat.content,
+                }
+                out_file.write(json.dumps(record, ensure_ascii=False) + "\n")
+                out_file.flush()
+                print(f"[{record['event_iso']}] {record['user_name']}: {record['content']}")
+
+            self.ws_thread = threading.Thread(target=self.fetcher.start, args=(on_chat,), daemon=True)
+            self.ws_thread.start()
+            self.out_file = out_file
+
+        def stop_fetch(self):
+            self.running = False
+            if self.fetcher:
+                self.fetcher.stop()
+            if hasattr(self, "ws_thread"):
+                self.ws_thread.join(timeout=5)
+            if hasattr(self, "out_file"):
+                self.out_file.close()
+
+    # ---------- 主循环 ---------- #
+    tasks = [LiveTask(t) for t in url_tasks]
+    for t in tasks:
+        t.start()
+
+    stop_event = threading.Event()
+
+    def display_info():
+        while not stop_event.is_set():
+            running = sum(1 for t in tasks if t.running)
+            total = len(tasks)
+            now = datetime.now(tz=display_tz).strftime("%H:%M:%S")
+            print(f"\r共监测{total}个直播 | 正在录制{running}个 | 循环间隔{delay_default}s | 当前时间: {now}", end="")
+            time.sleep(5)
+
+    info_thread = threading.Thread(target=display_info, daemon=True)
+    info_thread.start()
 
     try:
-        ws_thread = None
-        is_capturing = False
         while True:
-            try:
-                status = fetcher.fetch_live_status()
-                anchor = status.get("anchor") or ""
-                title = status.get("title") or ""
-            except Exception as e:  # network errors should not crash
-                print(f"[watcher] 获取直播状态失败: {e}")
-                status = {"is_live": False, "status": None, "anchor": "", "title": ""}
-
-            ts = datetime.now(tz=display_tz).isoformat()
-            if status["is_live"] and not is_capturing:
-                print(f"[{ts}] {anchor or live_id} 已开播，开始抓取弹幕。标题: {title}")
-                ws_thread = threading.Thread(target=fetcher.start, args=(on_chat,), daemon=True)
-                ws_thread.start()
-                is_capturing = True
-            elif (not status["is_live"]) and is_capturing:
-                print(f"[{ts}] 直播已结束，停止抓取弹幕。")
-                fetcher.stop()
-                if ws_thread:
-                    ws_thread.join(timeout=5)
-                is_capturing = False
-
-            sleep_sec = poll_live if status["is_live"] else poll_off
-            time.sleep(max(5, sleep_sec))
-
+            time.sleep(1)
     except KeyboardInterrupt:
-        print("\nStopped by user.")
+        print("\n收到退出指令，正在停止...")
     finally:
-        fetcher.stop()
-        out_file.close()
+        stop_event.set()
+        for t in tasks:
+            t.stop_flag = True
+            t.stop_fetch()
+        for t in tasks:
+            t.join(timeout=3)
+        info_thread.join(timeout=3)
+
 
 
 if __name__ == "__main__":
