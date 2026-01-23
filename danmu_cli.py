@@ -12,15 +12,18 @@ Notes:
 """
 
 import argparse
+import configparser
 import gzip
 import hashlib
 import json
+import os
 import random
 import re
 import string
 import threading
 import time
 from datetime import datetime, timezone, timedelta
+from pathlib import Path
 import urllib.parse
 
 import execjs
@@ -125,6 +128,52 @@ class DanmuFetcher:
         ctx = execjs.compile(execute_js(self.abogus_file))
         return ctx.call("get_ab", url, self.user_agent)
 
+    # -------- live status -------- #
+    def fetch_live_status(self) -> dict:
+        """
+        Poll Douyin web enter API to determine whether the room is live.
+        Returns dict with keys: is_live(bool), status(int|None), title(str), anchor(str).
+        """
+
+        ms_token = generate_ms_token()
+        params = {
+            "aid": "6383",
+            "app_name": "douyin_web",
+            "live_id": "1",
+            "device_platform": "web",
+            "language": "zh-CN",
+            "browser_language": "zh-CN",
+            "browser_platform": "Win32",
+            "browser_name": "Chrome",
+            "browser_version": "116.0.0.0",
+            "web_rid": self.live_id,
+            "msToken": ms_token,
+        }
+
+        query = urllib.parse.urlencode(params)
+        a_bogus = self.get_a_bogus(params)
+        api = f"https://live.douyin.com/webcast/room/web/enter/?{query}&a_bogus={a_bogus}"
+        headers = {
+            "User-Agent": self.user_agent,
+            "cookie": f"ttwid={self.ttwid}; msToken={ms_token}",
+            "referer": f"https://live.douyin.com/{self.live_id}",
+        }
+
+        resp = self.session.get(api, headers=headers, timeout=10)
+        resp.raise_for_status()
+        data = resp.json().get("data", {})
+        room_list = data.get("data") or []
+        room_info = room_list[0] if room_list else {}
+        status = room_info.get("status")
+        anchor = room_info.get("anchor_name") or (data.get("user") or {}).get("nickname") or ""
+        title = room_info.get("title") or ""
+        return {
+            "is_live": status == 2,
+            "status": status,
+            "anchor": anchor,
+            "title": title,
+        }
+
     # -------- runtime -------- #
     def start(self, on_chat):
         self._running = True
@@ -214,16 +263,56 @@ class DanmuFetcher:
 
 def main():
     parser = argparse.ArgumentParser(description="Fetch Douyin live danmu and save to file.")
-    parser.add_argument("--live-id", required=True, help="Douyin live room ID (from live.douyin.com/<id>)")
-    parser.add_argument("--out", default="danmu.jsonl", help="Output file path (JSON Lines).")
-    parser.add_argument("--tz", default="Asia/Shanghai", help="Display timezone (e.g., Asia/Shanghai, UTC).")
+    parser.add_argument("--live-id", help="Douyin live room ID (from live.douyin.com/<id>)")
+    parser.add_argument("--out", help="Output file path (JSON Lines).")
+    parser.add_argument("--tz", help="Display timezone (e.g., Asia/Shanghai, UTC).")
+    parser.add_argument("--config", default="config/config.ini", help="Config file path (auto-created if missing).")
+    parser.add_argument("--poll-live", type=int, help="Polling interval (seconds) while live.")
+    parser.add_argument("--poll-off", type=int, help="Polling interval (seconds) while offline.")
     args = parser.parse_args()
 
-    tz_offset = timedelta(hours=8) if args.tz.lower() == "asia/shanghai" else timedelta(0)
+    defaults = {
+        "live_id": "",
+        "out": "danmu.jsonl",
+        "tz": "Asia/Shanghai",
+        "poll_live": 15,
+        "poll_off": 45,
+    }
+
+    cfg = configparser.ConfigParser()
+    cfg_path = Path(args.config)
+    cfg_dir = cfg_path.parent
+    os.makedirs(cfg_dir, exist_ok=True)
+
+    if cfg_path.exists():
+        cfg.read(cfg_path, encoding="utf-8")
+    if "douyin" not in cfg:
+        cfg["douyin"] = {}
+
+    # fill defaults for any missing keys
+    updated = False
+    for key, val in defaults.items():
+        if key not in cfg["douyin"]:
+            cfg["douyin"][key] = str(val)
+            updated = True
+    if updated:
+        with open(cfg_path, "w", encoding="utf-8") as f:
+            cfg.write(f)
+
+    live_id = args.live_id or cfg["douyin"].get("live_id", "").strip()
+    if not live_id:
+        raise SystemExit("请在 --live-id 或配置文件 [douyin].live_id 中提供直播间 ID")
+
+    out_path = args.out or cfg["douyin"].get("out", defaults["out"])
+    tz_value = args.tz or cfg["douyin"].get("tz", defaults["tz"])
+    poll_live = args.poll_live or int(cfg["douyin"].get("poll_live", defaults["poll_live"]))
+    poll_off = args.poll_off or int(cfg["douyin"].get("poll_off", defaults["poll_off"]))
+
+    tz_offset = timedelta(hours=8) if tz_value.lower() == "asia/shanghai" else timedelta(0)
     display_tz = timezone(tz_offset)
 
-    fetcher = DanmuFetcher(args.live_id)
-    out_file = open(args.out, "a", encoding="utf-8")
+    fetcher = DanmuFetcher(live_id)
+    out_file = open(out_path, "a", encoding="utf-8")
 
     def normalize_ts_ms(ts: int) -> int:
         """
@@ -260,7 +349,33 @@ def main():
         print(f"[{record['event_iso']}] {record['user_name']}: {record['content']}")
 
     try:
-        fetcher.start(on_chat)
+        ws_thread = None
+        is_capturing = False
+        while True:
+            try:
+                status = fetcher.fetch_live_status()
+                anchor = status.get("anchor") or ""
+                title = status.get("title") or ""
+            except Exception as e:  # network errors should not crash
+                print(f"[watcher] 获取直播状态失败: {e}")
+                status = {"is_live": False, "status": None, "anchor": "", "title": ""}
+
+            ts = datetime.now(tz=display_tz).isoformat()
+            if status["is_live"] and not is_capturing:
+                print(f"[{ts}] {anchor or live_id} 已开播，开始抓取弹幕。标题: {title}")
+                ws_thread = threading.Thread(target=fetcher.start, args=(on_chat,), daemon=True)
+                ws_thread.start()
+                is_capturing = True
+            elif (not status["is_live"]) and is_capturing:
+                print(f"[{ts}] 直播已结束，停止抓取弹幕。")
+                fetcher.stop()
+                if ws_thread:
+                    ws_thread.join(timeout=5)
+                is_capturing = False
+
+            sleep_sec = poll_live if status["is_live"] else poll_off
+            time.sleep(max(5, sleep_sec))
+
     except KeyboardInterrupt:
         print("\nStopped by user.")
     finally:
