@@ -23,3 +23,9 @@ env/
 node_modules/
 dist/
 build/
+
+# downloads
+downloads/
+
+# macOS
+*.DS_Store

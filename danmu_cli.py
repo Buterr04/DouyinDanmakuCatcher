@@ -33,7 +33,7 @@ import websocket
 from py_mini_racer import MiniRacer
 
 from ac_signature import get__ac_signature
-from protobuf.douyin import ChatMessage, PushFrame, Response
+from protobuf.douyin import ChatMessage, GiftMessage, PushFrame, Response
 
 VERSION = "v0.3.0-auto"
 
@@ -243,11 +243,13 @@ class DanmuFetcher:
             self.ws.send(ack, websocket.ABNF.OPCODE_BINARY)
 
         for msg in response.messages_list:
-            if msg.method != "WebcastChatMessage":
-                continue
             try:
-                chat = ChatMessage().parse(msg.payload)
-                on_chat(chat, response.now)
+                if msg.method == "WebcastChatMessage":
+                    chat = ChatMessage().parse(msg.payload)
+                    on_chat(chat, response.now)
+                elif msg.method == "WebcastGiftMessage":
+                    gift = GiftMessage().parse(msg.payload)
+                    on_chat(gift, response.now)
             except Exception:
                 continue
 
@@ -300,6 +302,8 @@ def main():
     filename_by_title = cfg_get("录制设置", "保存文件名是否包含标题", "否") == "是"
     video_save_path = cfg_get("录制设置", "直播保存路径(不填则默认)", "")
     tz_value = cfg_get("录制设置", "时区", "Asia/Shanghai")
+    gift_separate_file = cfg_get("录制设置", "礼物单独文件", "是") == "是"
+    gift_min_value = int(cfg_get("录制设置", "礼物价值下限(钻)", 0))
 
     # 同步写回默认值
     with open(args.config, "w", encoding="utf-8") as f:
@@ -362,6 +366,10 @@ def main():
             return ts // 1000
         return ts // 1_000_000
 
+    def format_iso_from_ms(ts_ms: int) -> str:
+        dt = datetime.fromtimestamp(ts_ms / 1000, tz=display_tz).replace(tzinfo=None)
+        return dt.isoformat(timespec="seconds")
+
     def resolve_live_id(url: str) -> str:
         """Resolve to live.douyin.com/<web_rid> by following redirects."""
         try:
@@ -393,6 +401,12 @@ def main():
         filename = f"{name}_{ts}.danmu.jsonl"
         return date_path / filename
 
+    def build_gift_outfile(danmu_path: Path) -> Path:
+        name = danmu_path.name
+        if name.endswith(".danmu.jsonl"):
+            return danmu_path.with_name(name.replace(".danmu.jsonl", ".gift.jsonl"))
+        return danmu_path.with_name(name + ".gift.jsonl")
+
     # ---------- 单直播任务线程 ---------- #
     class LiveTask(threading.Thread):
         def __init__(self, task_conf):
@@ -422,9 +436,9 @@ def main():
                         if self.pending_stop_deadline:
                             self.pending_stop_deadline = None
                         if not self.running and self.live_id:
-                        outfile = build_outfile("抖音直播", anchor_name or self.live_id, title)
-                        print(f"[{ts}] {anchor_name or self.live_id} 开播，弹幕保存到 {outfile}")
-                        self.start_fetch(anchor_name or self.live_id, outfile)
+                            outfile = build_outfile("抖音直播", anchor_name or self.live_id, title)
+                            print(f"[{ts}] {anchor_name or self.live_id} 开播，弹幕保存到 {outfile}")
+                            self.start_fetch(anchor_name or self.live_id, outfile)
                     elif (not is_live) and self.running:
                         if not self.pending_stop_deadline:
                             self.pending_stop_deadline = time.time() + self.grace_stop_seconds
@@ -451,28 +465,71 @@ def main():
             self.running = True
             self.fetcher = DanmuFetcher(self.live_id)
             out_file = open(outfile, "a", encoding="utf-8")
+            gift_out_file = None
+            if gift_separate_file:
+                gift_outfile = build_gift_outfile(outfile)
+                gift_out_file = open(gift_outfile, "a", encoding="utf-8")
 
-            def on_chat(chat: ChatMessage, server_now_ms: int):
+            def on_chat(msg_obj, server_now_ms: int):
                 recv_ts = time.time()
-                event_ms = normalize_ts_ms(chat.event_time)
+                recv_ms = int(recv_ts * 1000)
                 server_now_ms_norm = normalize_ts_ms(server_now_ms)
-                record = {
-                    "event_ts_ms": event_ms,
-                    "event_iso": datetime.fromtimestamp(event_ms / 1000, tz=display_tz).isoformat(),
-                    "server_now_ms": server_now_ms_norm,
-                    "server_now_iso": datetime.fromtimestamp(server_now_ms_norm / 1000, tz=display_tz).isoformat(),
-                    "recv_iso": datetime.fromtimestamp(recv_ts, tz=display_tz).isoformat(),
-                    "user_id": chat.user.id,
-                    "user_name": chat.user.nick_name,
-                    "content": chat.content,
-                }
-                out_file.write(json.dumps(record, ensure_ascii=False) + "\n")
-                out_file.flush()
-                print(f"[{record['event_iso']}] {record['user_name']}: {record['content']}")
+
+                if isinstance(msg_obj, ChatMessage):
+                    event_ms = normalize_ts_ms(msg_obj.event_time)
+                    record = {
+                        "event": "chat",
+                        "event_ts_ms": event_ms,
+                        "event_iso": format_iso_from_ms(event_ms),
+                        "server_now_ms": server_now_ms_norm,
+                        "server_now_iso": format_iso_from_ms(server_now_ms_norm),
+                        "recv_iso": format_iso_from_ms(recv_ms),
+                        "user_id": msg_obj.user.id,
+                        "user_name": msg_obj.user.nick_name,
+                        "content": msg_obj.content,
+                    }
+                    out_file.write(json.dumps(record, ensure_ascii=False) + "\n")
+                    out_file.flush()
+                    print(f"[{record['event_iso']}] {record['user_name']}: {record['content']}")
+                    return
+
+                if isinstance(msg_obj, GiftMessage):
+                    if gift_separate_file and gift_out_file is None:
+                        return
+                    send_ts = msg_obj.send_time or server_now_ms_norm
+                    event_ms = normalize_ts_ms(send_ts)
+                    gift_name = msg_obj.gift.name or str(msg_obj.gift_id or "")
+                    gift_value = msg_obj.gift.diamond_count
+                    if gift_min_value > 0 and (gift_value or 0) < gift_min_value:
+                        return
+                    record = {
+                        "event": "gift",
+                        "event_ts_ms": event_ms,
+                        "event_iso": format_iso_from_ms(event_ms),
+                        "server_now_ms": server_now_ms_norm,
+                        "server_now_iso": format_iso_from_ms(server_now_ms_norm),
+                        "recv_iso": format_iso_from_ms(recv_ms),
+                        "user_id": msg_obj.user.id,
+                        "user_name": msg_obj.user.nick_name,
+                        "gift_id": msg_obj.gift_id,
+                        "gift_name": gift_name,
+                        "gift_count": msg_obj.repeat_count or msg_obj.combo_count or msg_obj.group_count or msg_obj.total_count or 1,
+                        "gift_combo": msg_obj.combo_count,
+                        "gift_value": gift_value,
+                    }
+                    target_file = gift_out_file if gift_separate_file else out_file
+                    target_file.write(json.dumps(record, ensure_ascii=False) + "\n")
+                    target_file.flush()
+                    value_str = f"{gift_value}钻" if gift_value else "未知价值"
+                    print(
+                        f"[{record['event_iso']}] {record['user_name']} 送出 {gift_name} x{record['gift_count']} ({value_str})"
+                    )
 
             self.ws_thread = threading.Thread(target=self.fetcher.start, args=(on_chat,), daemon=True)
             self.ws_thread.start()
             self.out_file = out_file
+            if gift_out_file:
+                self.gift_out_file = gift_out_file
 
         def stop_fetch(self):
             self.running = False
@@ -482,6 +539,8 @@ def main():
                 self.ws_thread.join(timeout=5)
             if hasattr(self, "out_file"):
                 self.out_file.close()
+            if hasattr(self, "gift_out_file"):
+                self.gift_out_file.close()
 
     # ---------- 主循环 ---------- #
     tasks = [LiveTask(t) for t in url_tasks]
