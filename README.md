@@ -2,6 +2,10 @@
 
 轻量级 CLI，用于从抖音直播间拉取弹幕并写入 JSONL。本项目基于 [DouyinLiveWebFetcher](https://github.com/saermart/DouyinLiveWebFetcher) 改造，轮询/配置/开播检测 参考 [DouyinLiveRecorder](https://github.com/ihmily/DouyinLiveRecorder) 的逻辑，可直接复用 `config/config.ini` 与 `config/URL_config.ini` 的写法。
 
+## 功能
+- 捕获抖音弹幕与礼物信息，可分文件储存，提供礼物价值过滤功能
+
+  
 ## 与上游的区别
 - 精简为单文件入口 `danmu_cli.py`，专注 Webcast 聊天消息。
 - 输出 JSONL，时间戳做毫秒归一化，便于后续分析。
@@ -23,7 +27,10 @@
 ```bash
 python danmu_cli.py
 ```
-程序会循环轮询：未开播则等待，检测到开播自动开启弹幕 WebSocket；关播后自动断开并继续轮询。
+程序会循环轮询：未开播则等待，检测到开播自动开启弹幕 WebSocket；关播后30min内未重新开播则自动断开ws连接并继续轮询。
+
+## Docker运行
+项目根目录运行命令`docker compose up`，自动拉取镜像并运行服务
 
 ## 输出与存储路径
 保存位置遵循 DouyinLiveRecorder 的目录习惯（默认 `downloads/`）：  
