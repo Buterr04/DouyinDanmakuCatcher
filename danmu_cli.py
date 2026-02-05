@@ -404,6 +404,8 @@ def main():
             self.fetcher = None
             self.stop_flag = False
             self.live_id = resolve_live_id(self.url)
+            self.pending_stop_deadline = None
+            self.grace_stop_seconds = 30 * 60
 
         def run(self):
             while not self.stop_flag:
@@ -416,13 +418,22 @@ def main():
                         self.live_id = resolve_live_id(self.url)
 
                     ts = datetime.now(tz=display_tz).isoformat()
-                    if is_live and not self.running and self.live_id:
+                    if is_live:
+                        if self.pending_stop_deadline:
+                            self.pending_stop_deadline = None
+                        if not self.running and self.live_id:
                         outfile = build_outfile("抖音直播", anchor_name or self.live_id, title)
                         print(f"[{ts}] {anchor_name or self.live_id} 开播，弹幕保存到 {outfile}")
                         self.start_fetch(anchor_name or self.live_id, outfile)
                     elif (not is_live) and self.running:
-                        print(f"[{ts}] {anchor_name or self.live_id} 已关播，停止弹幕抓取")
-                        self.stop_fetch()
+                        if not self.pending_stop_deadline:
+                            self.pending_stop_deadline = time.time() + self.grace_stop_seconds
+                            mins = int(self.grace_stop_seconds / 60)
+                            print(f"[{ts}] {anchor_name or self.live_id} 已关播，进入{mins}分钟延迟断开")
+                        elif time.time() >= self.pending_stop_deadline:
+                            print(f"[{ts}] {anchor_name or self.live_id} 延迟到期，停止弹幕抓取")
+                            self.pending_stop_deadline = None
+                            self.stop_fetch()
 
                 except Exception as e:
                     print(f"[task] {self.url} 状态检测失败: {e}")
