@@ -1,0 +1,14 @@
+version: "3.8"
+
+services:
+  danmu:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: douyin-danmu:latest
+    restart: unless-stopped
+    volumes:
+      - ./config:/app/config
+      - ./downloads:/app/downloads
+    environment:
+      - TZ=Asia/Shanghai
